@@ -126,6 +126,34 @@ function responseFromBytes(args: {
   return new Response(args.bytes, { status: 200, headers });
 }
 
+function pickProxyHeaders(args: {
+  upstream: Response;
+  contentType: string;
+  cacheSeconds: number;
+  attempts: number;
+}): Headers {
+  const h = new Headers();
+  h.set("Access-Control-Allow-Origin", "*");
+  h.set("Cache-Control", `public, max-age=${args.cacheSeconds}`);
+  h.set("X-Grok-Upstream-Attempts", String(args.attempts));
+  h.set("Accept-Ranges", args.upstream.headers.get("accept-ranges") || "bytes");
+  if (args.contentType) h.set("Content-Type", args.contentType);
+
+  const contentLength = args.upstream.headers.get("content-length");
+  if (contentLength) h.set("Content-Length", contentLength);
+
+  const contentRange = args.upstream.headers.get("content-range");
+  if (contentRange) h.set("Content-Range", contentRange);
+
+  const etag = args.upstream.headers.get("etag");
+  if (etag) h.set("ETag", etag);
+
+  const lastModified = args.upstream.headers.get("last-modified");
+  if (lastModified) h.set("Last-Modified", lastModified);
+
+  return h;
+}
+
 function toUpstreamHeaders(args: { pathname: string; cookie: string; settings: Awaited<ReturnType<typeof getSettings>>["grok"] }): Record<string, string> {
   const headers = getDynamicHeaders(args.settings, args.pathname);
   headers.Cookie = args.cookie;
@@ -139,6 +167,47 @@ function toUpstreamHeaders(args: { pathname: string; cookie: string; settings: A
   headers["Upgrade-Insecure-Requests"] = "1";
   headers.Referer = "https://grok.com/";
   return headers;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldRetryUpstream(type: CacheType, status: number): boolean {
+  if (type !== "video") return false;
+  if (status === 404 || status === 408 || status === 425 || status === 429) return true;
+  return status >= 500 && status <= 599;
+}
+
+function shouldPenalizeToken(status: number): boolean {
+  return status === 401 || status === 403 || status === 429;
+}
+
+async function fetchUpstreamWithRetry(args: {
+  url: URL;
+  baseHeaders: Record<string, string>;
+  rangeHeader: string | undefined;
+  type: CacheType;
+}): Promise<{ upstream: Response; attempts: number }> {
+  const delaysMs = args.type === "video" ? [0, 300, 800, 1600] : [0];
+
+  for (let i = 0; i < delaysMs.length; i++) {
+    if (i > 0) await sleep(delaysMs[i]!);
+
+    const headers = args.rangeHeader ? { ...args.baseHeaders, Range: args.rangeHeader } : args.baseHeaders;
+    const upstream = await fetch(args.url.toString(), { headers });
+
+    if ((upstream.ok && upstream.body) || i === delaysMs.length - 1 || !shouldRetryUpstream(args.type, upstream.status)) {
+      return { upstream, attempts: i + 1 };
+    }
+
+    // Drain body before retry to avoid leaking resources.
+    await upstream.arrayBuffer().catch(() => new ArrayBuffer(0));
+  }
+
+  // Unreachable with current loop logic; keep a strict fallback for type safety.
+  const headers = args.rangeHeader ? { ...args.baseHeaders, Range: args.rangeHeader } : args.baseHeaders;
+  return { upstream: await fetch(args.url.toString(), { headers }), attempts: 1 };
 }
 
 mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
@@ -217,12 +286,21 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
 
   // Range requests: KV can't stream partial content efficiently; proxy from upstream.
   // (If the object is cached and within KV limits, we do support Range by slicing bytes above.)
-  const upstream = await fetch(url.toString(), { headers: rangeHeader ? { ...baseHeaders, Range: rangeHeader } : baseHeaders });
+  const { upstream, attempts } = await fetchUpstreamWithRetry({ url, baseHeaders, rangeHeader, type });
   if (!upstream.ok || !upstream.body) {
     const txt = await upstream.text().catch(() => "");
-    await recordTokenFailure(c.env.DB, chosen.token, upstream.status, txt.slice(0, 200));
-    await applyCooldown(c.env.DB, chosen.token, upstream.status);
-    return new Response(`Upstream ${upstream.status}`, { status: upstream.status });
+    if (shouldPenalizeToken(upstream.status)) {
+      await recordTokenFailure(c.env.DB, chosen.token, upstream.status, txt.slice(0, 200));
+      await applyCooldown(c.env.DB, chosen.token, upstream.status);
+    }
+    return new Response(`Upstream ${upstream.status}`, {
+      status: upstream.status,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-store",
+        "X-Grok-Upstream-Attempts": String(attempts),
+      },
+    });
   }
 
   const contentType = upstream.headers.get("content-type") ?? "";
@@ -271,16 +349,10 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
       })(),
     );
 
-    const outHeaders = new Headers(upstream.headers);
-    outHeaders.set("Access-Control-Allow-Origin", "*");
-    outHeaders.set("Cache-Control", `public, max-age=${cacheSeconds}`);
-    if (contentType) outHeaders.set("Content-Type", contentType);
+    const outHeaders = pickProxyHeaders({ upstream, contentType, cacheSeconds, attempts });
     return new Response(toClient, { status: upstream.status, headers: outHeaders });
   }
 
-  const outHeaders = new Headers(upstream.headers);
-  outHeaders.set("Access-Control-Allow-Origin", "*");
-  outHeaders.set("Cache-Control", `public, max-age=${cacheSeconds}`);
-  if (contentType) outHeaders.set("Content-Type", contentType);
+  const outHeaders = pickProxyHeaders({ upstream, contentType, cacheSeconds, attempts });
   return new Response(upstream.body, { status: upstream.status, headers: outHeaders });
 });

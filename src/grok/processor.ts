@@ -397,7 +397,7 @@ export function createOpenAiStreamFromGrokNdjson(
           }
         }
 
-        if (!videoChunkSent && lastVideoUrl) {
+        if (!videoChunkSent && lastVideoUrl && lastVideoProgress >= 100) {
           controller.enqueue(
             encoder.encode(
               makeChunk(id, created, currentModel, buildVideoContentFromUpstream({
@@ -449,6 +449,7 @@ export async function parseOpenAiFromGrokNdjson(
   let pendingVideoUrl = "";
   let pendingThumbUrl = "";
   let hasCompletedVideo = false;
+  let pendingVideoProgress = -1;
   for (const line of lines) {
     let data: GrokNdjson;
     try {
@@ -466,6 +467,7 @@ export async function parseOpenAiFromGrokNdjson(
     const videoResp = grok.streamingVideoGenerationResponse;
     if (videoResp) {
       const progress = typeof videoResp.progress === "number" ? videoResp.progress : 0;
+      if (progress > pendingVideoProgress) pendingVideoProgress = progress;
       if (typeof videoResp.videoUrl === "string" && videoResp.videoUrl) {
         pendingVideoUrl = videoResp.videoUrl;
         pendingThumbUrl =
@@ -512,7 +514,7 @@ export async function parseOpenAiFromGrokNdjson(
     break;
   }
 
-  if (!hasCompletedVideo && !content && pendingVideoUrl) {
+  if (!hasCompletedVideo && !content && pendingVideoUrl && pendingVideoProgress >= 100) {
     content = buildVideoContentFromUpstream({
       videoUrl: pendingVideoUrl,
       thumbnailUrl: pendingThumbUrl || undefined,
