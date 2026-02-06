@@ -73,6 +73,29 @@ function buildVideoHtml(args: { videoUrl: string; posterUrl?: string; posterPrev
   return buildVideoTag(args.videoUrl);
 }
 
+function buildVideoContentFromUpstream(args: {
+  videoUrl: string;
+  thumbnailUrl?: string;
+  global: GlobalSettings;
+  origin: string;
+  posterPreview: boolean;
+}): string {
+  const videoPath = encodeAssetPath(args.videoUrl);
+  const src = toImgProxyUrl(args.global, args.origin, videoPath);
+
+  let poster: string | undefined;
+  if (args.thumbnailUrl) {
+    const thumbPath = encodeAssetPath(args.thumbnailUrl);
+    poster = toImgProxyUrl(args.global, args.origin, thumbPath);
+  }
+
+  return buildVideoHtml({
+    videoUrl: src,
+    posterPreview: args.posterPreview,
+    ...(poster ? { posterUrl: poster } : {}),
+  });
+}
+
 function base64UrlEncode(input: string): string {
   const bytes = new TextEncoder().encode(input);
   let binary = "";
@@ -163,6 +186,9 @@ export function createOpenAiStreamFromGrokNdjson(
       let thinkingFinished = false;
       let videoProgressStarted = false;
       let lastVideoProgress = -1;
+      let videoChunkSent = false;
+      let lastVideoUrl = "";
+      let lastThumbUrl = "";
 
       let buffer = "";
 
@@ -255,6 +281,11 @@ export function createOpenAiStreamFromGrokNdjson(
               const videoUrl = typeof videoResp.videoUrl === "string" ? videoResp.videoUrl : "";
               const thumbUrl = typeof videoResp.thumbnailImageUrl === "string" ? videoResp.thumbnailImageUrl : "";
 
+              if (videoUrl) {
+                lastVideoUrl = videoUrl;
+                lastThumbUrl = thumbUrl;
+              }
+
               if (progress > lastVideoProgress) {
                 lastVideoProgress = progress;
                 if (showThinking) {
@@ -271,30 +302,19 @@ export function createOpenAiStreamFromGrokNdjson(
                 }
               }
 
-              if (videoUrl) {
-                const videoPath = encodeAssetPath(videoUrl);
-                const src = toImgProxyUrl(global, origin, videoPath);
-
-                let poster: string | undefined;
-                if (thumbUrl) {
-                  const thumbPath = encodeAssetPath(thumbUrl);
-                  poster = toImgProxyUrl(global, origin, thumbPath);
-                }
-
+              if (!videoChunkSent && progress >= 100 && lastVideoUrl) {
                 controller.enqueue(
                   encoder.encode(
-                    makeChunk(
-                      id,
-                      created,
-                      currentModel,
-                      buildVideoHtml({
-                        videoUrl: src,
-                        posterPreview: settings.video_poster_preview === true,
-                        ...(poster ? { posterUrl: poster } : {}),
-                      }),
-                    ),
+                    makeChunk(id, created, currentModel, buildVideoContentFromUpstream({
+                      videoUrl: lastVideoUrl,
+                      thumbnailUrl: lastThumbUrl || undefined,
+                      global,
+                      origin,
+                      posterPreview: settings.video_poster_preview === true,
+                    })),
                   ),
                 );
+                videoChunkSent = true;
               }
               continue;
             }
@@ -377,6 +397,20 @@ export function createOpenAiStreamFromGrokNdjson(
           }
         }
 
+        if (!videoChunkSent && lastVideoUrl) {
+          controller.enqueue(
+            encoder.encode(
+              makeChunk(id, created, currentModel, buildVideoContentFromUpstream({
+                videoUrl: lastVideoUrl,
+                thumbnailUrl: lastThumbUrl || undefined,
+                global,
+                origin,
+                posterPreview: settings.video_poster_preview === true,
+              })),
+            ),
+          );
+        }
+
         controller.enqueue(encoder.encode(makeChunk(id, created, currentModel, "", "stop")));
         controller.enqueue(encoder.encode(makeDone()));
         if (opts.onFinish) await opts.onFinish({ status: finalStatus, duration: (Date.now() - startTime) / 1000 });
@@ -412,6 +446,9 @@ export async function parseOpenAiFromGrokNdjson(
 
   let content = "";
   let model = requestedModel;
+  let pendingVideoUrl = "";
+  let pendingThumbUrl = "";
+  let hasCompletedVideo = false;
   for (const line of lines) {
     let data: GrokNdjson;
     try {
@@ -427,23 +464,27 @@ export async function parseOpenAiFromGrokNdjson(
     if (!grok) continue;
 
     const videoResp = grok.streamingVideoGenerationResponse;
-    if (videoResp?.videoUrl && typeof videoResp.videoUrl === "string") {
-      const videoPath = encodeAssetPath(videoResp.videoUrl);
-      const src = toImgProxyUrl(global, origin, videoPath);
-
-      let poster: string | undefined;
-      if (typeof videoResp.thumbnailImageUrl === "string" && videoResp.thumbnailImageUrl) {
-        const thumbPath = encodeAssetPath(videoResp.thumbnailImageUrl);
-        poster = toImgProxyUrl(global, origin, thumbPath);
+    if (videoResp) {
+      const progress = typeof videoResp.progress === "number" ? videoResp.progress : 0;
+      if (typeof videoResp.videoUrl === "string" && videoResp.videoUrl) {
+        pendingVideoUrl = videoResp.videoUrl;
+        pendingThumbUrl =
+          typeof videoResp.thumbnailImageUrl === "string" ? videoResp.thumbnailImageUrl : "";
       }
 
-      content = buildVideoHtml({
-        videoUrl: src,
-        posterPreview: settings.video_poster_preview === true,
-        ...(poster ? { posterUrl: poster } : {}),
-      });
-      model = requestedModel;
-      break;
+      if (progress >= 100 && pendingVideoUrl) {
+        content = buildVideoContentFromUpstream({
+          videoUrl: pendingVideoUrl,
+          thumbnailUrl: pendingThumbUrl || undefined,
+          global,
+          origin,
+          posterPreview: settings.video_poster_preview === true,
+        });
+        model = requestedModel;
+        hasCompletedVideo = true;
+        break;
+      }
+      continue;
     }
 
     const modelResp = grok.modelResponse;
@@ -469,6 +510,17 @@ export async function parseOpenAiFromGrokNdjson(
 
     // For normal chat replies, the first modelResponse is enough.
     break;
+  }
+
+  if (!hasCompletedVideo && !content && pendingVideoUrl) {
+    content = buildVideoContentFromUpstream({
+      videoUrl: pendingVideoUrl,
+      thumbnailUrl: pendingThumbUrl || undefined,
+      global,
+      origin,
+      posterPreview: settings.video_poster_preview === true,
+    });
+    model = requestedModel;
   }
 
   return {
