@@ -75,7 +75,7 @@ function buildVideoHtml(args: { videoUrl: string; posterUrl?: string; posterPrev
 
 function buildVideoContentFromUpstream(args: {
   videoUrl: string;
-  thumbnailUrl?: string;
+  thumbnailUrl?: string | undefined;
   global: GlobalSettings;
   origin: string;
   posterPreview: boolean;
